@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const multer = require('multer');
@@ -7,9 +7,9 @@ const path = require('path');
 const Jimp = require('jimp');
 
 const app = express();
-const port = process.env.PORT || 3000; // Render ka Port lena zaroori hai
+const port = process.env.PORT || 3000;
 
-// Render par disk temporary hoti hai, /tmp use karenge
+// Setup Upload Directory
 const uploadDir = '/tmp/uploads';
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -22,18 +22,26 @@ const upload = multer({ storage: storage });
 app.use(express.static('public'));
 app.use(express.json());
 
+// 1. Upload Route
 app.post('/upload', upload.single('image'), (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No file' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     res.json({ filename: req.file.filename });
 });
 
+// 2. Connect Route (Improved Logic)
 app.get('/connect', async (req, res) => {
     const { phoneNumber, filename } = req.query;
-    if (!phoneNumber || !filename) return res.status(400).json({ error: 'Missing data' });
-
-    const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-    const sessionFolder = `/tmp/session-${Date.now()}`;
     
+    // Validation
+    if (!phoneNumber || !filename) return res.status(400).json({ error: 'Missing parameters' });
+    
+    // Clean number (Remove + and spaces)
+    const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+    
+    console.log(`Request received for: ${cleanNumber}`); // Log for debugging
+
+    // Create unique session
+    const sessionFolder = `/tmp/session-${Date.now()}`;
     const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
 
     try {
@@ -41,42 +49,89 @@ app.get('/connect', async (req, res) => {
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
             auth: state,
-            browser: ["Render", "Chrome", "1.0"]
+            browser: ["Ubuntu", "Chrome", "20.0.04"], // Stable browser config
+            markOnlineOnConnect: false
         });
 
-        if (!sock.authState.creds.me && !sock.authState.creds.registered) {
-            setTimeout(async () => {
-                try {
-                    const code = await sock.requestPairingCode(cleanNumber);
-                    res.json({ code: code?.match(/.{1,4}/g)?.join("-") || code });
-                } catch (e) {
-                    if(!res.headersSent) res.status(500).json({ error: 'Failed' });
-                }
-            }, 3000);
-        }
+        // Save credentials whenever they update
+        sock.ev.on('creds.update', saveCreds);
 
+        // Wait for connection to update
         sock.ev.on('connection.update', async (update) => {
-            if (update.connection === 'open') {
-                console.log('Connected!');
+            const { connection, lastDisconnect } = update;
+
+            if (connection === 'open') {
+                console.log('Connected successfully!');
+                
+                // DP Update Logic
                 try {
                     const imgPath = path.join(uploadDir, filename);
-                    const img = await Jimp.read(imgPath);
-                    const min = Math.min(img.getWidth(), img.getHeight());
-                    const buffer = await img.crop(0,0,min,min).resize(640,640).getBufferAsync(Jimp.MIME_JPEG);
-                    
-                    await sock.query({
-                        tag: 'iq',
-                        attrs: { to: sock.user.id, type: 'set', xmlns: 'w:profile:picture' },
-                        content: [{ tag: 'picture', attrs: { type: 'image' }, content: buffer }]
-                    });
-                    
+                    if (fs.existsSync(imgPath)) {
+                        const img = await Jimp.read(imgPath);
+                        const min = Math.min(img.getWidth(), img.getHeight());
+                        const buffer = await img.crop(0,0,min,min).resize(640,640).getBufferAsync(Jimp.MIME_JPEG);
+                        
+                        await sock.query({
+                            tag: 'iq',
+                            attrs: { to: sock.user.id, type: 'set', xmlns: 'w:profile:picture' },
+                            content: [{ tag: 'picture', attrs: { type: 'image' }, content: buffer }]
+                        });
+                        console.log('DP Updated');
+                    }
+                } catch (e) {
+                    console.error('Error processing image:', e);
+                } finally {
+                    // Cleanup and Close
                     await sock.logout();
-                    fs.rmSync(sessionFolder, { recursive: true, force: true });
-                } catch (e) { console.error(e); }
+                    // Give it a moment to logout before deleting files
+                    setTimeout(() => {
+                        try {
+                            if(fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
+                        } catch(e) {}
+                    }, 2000);
+                }
+            }
+            
+            // Handle Connect Failure
+            if (connection === 'close') {
+                const reason = lastDisconnect?.error?.output?.statusCode;
+                if (reason !== DisconnectReason.loggedOut) {
+                   // Usually we reconnect, but for one-time scripts we just cleanup
+                   try {
+                       if(fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
+                   } catch(e) {}
+                }
             }
         });
-        sock.ev.on('creds.update', saveCreds);
-    } catch (e) { if(!res.headersSent) res.status(500).json({ error: 'Error' }); }
+
+        // --- PAIRING CODE LOGIC (Updated) ---
+        // Wait 2 seconds for socket to initialize
+        await delay(2000);
+
+        if (!sock.authState.creds.me && !sock.authState.creds.registered) {
+            try {
+                console.log('Requesting pairing code...');
+                const code = await sock.requestPairingCode(cleanNumber);
+                const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+                console.log('Code generated:', formattedCode);
+                
+                // Send response to frontend
+                res.json({ code: formattedCode });
+                
+            } catch (err) {
+                console.error('Failed to get code:', err);
+                if(!res.headersSent) res.status(500).json({ error: 'WhatsApp Connection Failed. Try again.' });
+                // Cleanup if failed
+                try { if(fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true }); } catch(e){}
+            }
+        } else {
+            if(!res.headersSent) res.status(400).json({ error: 'Session already exists' });
+        }
+
+    } catch (error) {
+        console.error('Main Error:', error);
+        if(!res.headersSent) res.status(500).json({ error: 'Internal Server Error' });
+    }
 });
 
-app.listen(port, () => console.log(`Server on port ${port}`));
+app.listen(port, () => console.log(`Server started on port ${port}`));

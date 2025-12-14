@@ -1,1 +1,92 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp DP Tool</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #f0f2f5; text-align: center; }
+        .container { max-width: 500px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        input, button { width: 100%; padding: 12px; margin: 10px 0; border-radius: 5px; border: 1px solid #ccc; box-sizing: border-box; }
+        button { background: #008069; color: white; border: none; font-weight: bold; cursor: pointer; }
+        button:disabled { background: #ccc; }
+        #code { font-size: 24px; font-weight: bold; letter-spacing: 2px; color: #008069; margin: 20px 0; padding: 10px; background: #e8f5e9; display: none; }
+        #debug { color: red; font-size: 12px; margin-top: 10px; text-align: left; white-space: pre-wrap; display: none; background: #ffebee; padding: 10px; }
+        .instructions { text-align: left; font-size: 14px; color: #555; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Set Full DP</h2>
+        <input type="file" id="file" accept="image/*">
+        <input type="number" id="phone" placeholder="919999999999 (No +)">
+        <button id="btn" onclick="startProcess()">Get Pairing Code</button>
+        
+        <div id="code"></div>
+        <div id="debug"></div>
+
+        <div class="instructions">
+            <strong>Note:</strong><br>
+            1. Wait 20-30 seconds after clicking.<br>
+            2. If you get a notification on WhatsApp, ignore it initially.<br>
+            3. Enter the code shown ABOVE into WhatsApp > Linked Devices.
+        </div>
+    </div>
+
+    <script>
+        async function startProcess() {
+            const file = document.getElementById('file').files[0];
+            const phone = document.getElementById('phone').value;
+            const btn = document.getElementById('btn');
+            const debug = document.getElementById('debug');
+            const codeDiv = document.getElementById('code');
+
+            // Reset UI
+            debug.style.display = 'none';
+            debug.innerText = '';
+            codeDiv.style.display = 'none';
+            
+            if (!file || !phone) return alert("Select image and enter number");
+
+            btn.disabled = true;
+            btn.innerText = "Processing (Wait 20s)...";
+
+            try {
+                // Step 1: Upload
+                const formData = new FormData();
+                formData.append('image', file);
+                
+                const upRes = await fetch('/upload', { method: 'POST', body: formData });
+                if (!upRes.ok) throw new Error("Image Upload Failed");
+                const upData = await upRes.json();
+                
+                // Step 2: Connect
+                const conRes = await fetch(`/connect?phoneNumber=${phone}&filename=${upData.filename}`);
+                const conText = await conRes.text(); // Get raw text first to debug
+                
+                try {
+                    const conData = JSON.parse(conText); // Try to parse JSON
+                    if (conData.error) throw new Error(conData.error);
+                    if (conData.code) {
+                        codeDiv.style.display = 'block';
+                        codeDiv.innerText = "CODE: " + conData.code;
+                        btn.innerText = "Success!";
+                    }
+                } catch (e) {
+                    // If JSON parse fails, show raw text (Server Error)
+                    throw new Error("Server Error: " + conText);
+                }
+
+            } catch (err) {
+                debug.style.display = 'block';
+                debug.innerText = "Error: " + err.message;
+                btn.innerText = "Try Again";
+            } finally {
+                btn.disabled = false;
+                if(btn.innerText !== "Success!") btn.innerText = "Get Pairing Code";
+            }
+        }
+    </script>
+</body>
+  </html>

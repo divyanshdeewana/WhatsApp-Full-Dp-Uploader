@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const multer = require('multer');
@@ -9,7 +9,7 @@ const Jimp = require('jimp');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Setup Upload Directory
+// Folders Setup
 const uploadDir = '/tmp/uploads';
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -22,48 +22,47 @@ const upload = multer({ storage: storage });
 app.use(express.static('public'));
 app.use(express.json());
 
-// 1. Upload Route
+// Server Check Route
+app.get('/', (req, res) => {
+    res.send('Server is Running. Use index.html');
+});
+
+// Upload
 app.post('/upload', upload.single('image'), (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!req.file) return res.status(400).json({ error: 'No file' });
     res.json({ filename: req.file.filename });
 });
 
-// 2. Connect Route (Improved Logic)
+// Main Logic
 app.get('/connect', async (req, res) => {
     const { phoneNumber, filename } = req.query;
-    
-    // Validation
-    if (!phoneNumber || !filename) return res.status(400).json({ error: 'Missing parameters' });
-    
-    // Clean number (Remove + and spaces)
-    const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-    
-    console.log(`Request received for: ${cleanNumber}`); // Log for debugging
+    if (!phoneNumber || !filename) return res.status(400).json({ error: 'Missing data' });
 
-    // Create unique session
-    const sessionFolder = `/tmp/session-${Date.now()}`;
+    const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+    const sessionName = `session-${cleanNumber}-${Date.now()}`;
+    const sessionFolder = path.join('/tmp', sessionName);
+
+    console.log(`Starting session for ${cleanNumber}`);
+
     const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
 
     try {
         const sock = makeWASocket({
-            logger: pino({ level: 'silent' }),
-            printQRInTerminal: false,
             auth: state,
-            browser: ["Ubuntu", "Chrome", "20.0.04"], // Stable browser config
-            markOnlineOnConnect: false
+            printQRInTerminal: false,
+            logger: pino({ level: "silent" }),
+            browser: Browsers.ubuntu("Chrome"), // Ye zaroori hai notification ke liye
+            markOnlineOnConnect: false,
+            generateHighQualityLinkPreview: true,
         });
 
-        // Save credentials whenever they update
         sock.ev.on('creds.update', saveCreds);
 
-        // Wait for connection to update
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
 
             if (connection === 'open') {
-                console.log('Connected successfully!');
-                
-                // DP Update Logic
+                console.log('Connected! Updating DP...');
                 try {
                     const imgPath = path.join(uploadDir, filename);
                     if (fs.existsSync(imgPath)) {
@@ -76,62 +75,62 @@ app.get('/connect', async (req, res) => {
                             attrs: { to: sock.user.id, type: 'set', xmlns: 'w:profile:picture' },
                             content: [{ tag: 'picture', attrs: { type: 'image' }, content: buffer }]
                         });
-                        console.log('DP Updated');
+                        console.log('DP Updated Successfully');
                     }
                 } catch (e) {
-                    console.error('Error processing image:', e);
+                    console.error('DP Error:', e);
                 } finally {
-                    // Cleanup and Close
                     await sock.logout();
-                    // Give it a moment to logout before deleting files
-                    setTimeout(() => {
-                        try {
-                            if(fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
-                        } catch(e) {}
-                    }, 2000);
+                    cleanup(sessionFolder);
                 }
             }
-            
-            // Handle Connect Failure
+
             if (connection === 'close') {
+                // Agar connection band ho jaye bina kaam kiye
                 const reason = lastDisconnect?.error?.output?.statusCode;
-                if (reason !== DisconnectReason.loggedOut) {
-                   // Usually we reconnect, but for one-time scripts we just cleanup
-                   try {
-                       if(fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
-                   } catch(e) {}
+                if (reason === DisconnectReason.restartRequired) {
+                    // Do nothing, let it restart if needed
+                } else {
+                    cleanup(sessionFolder);
                 }
             }
         });
 
-        // --- PAIRING CODE LOGIC (Updated) ---
-        // Wait 2 seconds for socket to initialize
-        await delay(2000);
-
-        if (!sock.authState.creds.me && !sock.authState.creds.registered) {
+        // Request Pairing Code
+        if (!sock.authState.creds.registered) {
+            await delay(3000); // 3 second wait karega connect hone ke liye
+            
             try {
-                console.log('Requesting pairing code...');
+                console.log('Requesting Code...');
                 const code = await sock.requestPairingCode(cleanNumber);
                 const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
-                console.log('Code generated:', formattedCode);
                 
-                // Send response to frontend
+                console.log(`Code Sent: ${formattedCode}`);
                 res.json({ code: formattedCode });
                 
             } catch (err) {
-                console.error('Failed to get code:', err);
-                if(!res.headersSent) res.status(500).json({ error: 'WhatsApp Connection Failed. Try again.' });
-                // Cleanup if failed
-                try { if(fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true }); } catch(e){}
+                console.error('Pairing Error:', err);
+                cleanup(sessionFolder);
+                if(!res.headersSent) res.status(500).json({ error: 'WhatsApp refused connection. Try again in 1 min.' });
             }
         } else {
-            if(!res.headersSent) res.status(400).json({ error: 'Session already exists' });
+            res.json({ error: "Already Registered" });
+            cleanup(sessionFolder);
         }
 
     } catch (error) {
-        console.error('Main Error:', error);
-        if(!res.headersSent) res.status(500).json({ error: 'Internal Server Error' });
+        console.error(error);
+        if(!res.headersSent) res.status(500).json({ error: 'Server Error' });
+        cleanup(sessionFolder);
     }
 });
 
-app.listen(port, () => console.log(`Server started on port ${port}`));
+function cleanup(folder) {
+    setTimeout(() => {
+        try {
+            if (fs.existsSync(folder)) fs.rmSync(folder, { recursive: true, force: true });
+        } catch (e) {}
+    }, 5000);
+}
+
+app.listen(port, () => console.log(`Server running on port ${port}`));
